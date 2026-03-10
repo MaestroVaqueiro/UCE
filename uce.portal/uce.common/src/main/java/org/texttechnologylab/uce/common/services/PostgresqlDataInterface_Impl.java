@@ -15,6 +15,7 @@ import org.texttechnologylab.uce.common.exceptions.DatabaseOperationException;
 import org.texttechnologylab.uce.common.exceptions.ExceptionUtils;
 import org.texttechnologylab.uce.common.models.Linkable;
 import org.texttechnologylab.uce.common.models.ModelBase;
+import org.texttechnologylab.uce.common.models.ModelEntity;
 import org.texttechnologylab.uce.common.models.UIMAAnnotation;
 import org.texttechnologylab.uce.common.models.biofid.BiofidTaxon;
 import org.texttechnologylab.uce.common.models.biofid.GazetteerTaxon;
@@ -33,6 +34,7 @@ import org.texttechnologylab.uce.common.models.search.*;
 import org.texttechnologylab.uce.common.models.topic.TopicValueBase;
 import org.texttechnologylab.uce.common.models.topic.TopicWord;
 import org.texttechnologylab.uce.common.models.topic.UnifiedTopic;
+import org.texttechnologylab.uce.common.models.topic.SentenceTopic;
 import org.texttechnologylab.uce.common.models.util.HealthStatus;
 import org.texttechnologylab.uce.common.utils.ReflectionUtils;
 import org.texttechnologylab.uce.common.utils.StringUtils;
@@ -42,6 +44,11 @@ import javax.persistence.NoResultException;
 import javax.persistence.criteria.Order;
 import javax.persistence.criteria.Path;
 import javax.persistence.criteria.Predicate;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.lang.reflect.Type;
+import java.nio.charset.StandardCharsets;
 import java.sql.Array;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
@@ -65,6 +72,7 @@ public class PostgresqlDataInterface_Impl implements DataInterface {
     public PostgresqlDataInterface_Impl() {
         sessionFactory = HibernateConf.buildSessionFactory();
         TestConnection();
+        initializeModelsFromJson();
     }
 
     public void TestConnection() {
@@ -1295,6 +1303,7 @@ public class PostgresqlDataInterface_Impl implements DataInterface {
             Document doc = session.createQuery(criteriaQuery).uniqueResult();
 
             if (doc != null) {
+                Hibernate.initialize(doc.getSentences());
                 //initializeCompleteDocument(doc, 0, 999999);
             }
             return doc;
@@ -2065,42 +2074,45 @@ public class PostgresqlDataInterface_Impl implements DataInterface {
         });
     }
 
-    public List<Object[]> getSentenceTopicsWithEntitiesByPageForDocument(long documentId) throws DatabaseOperationException {
+    public List<Object[]> getSentenceTopicsWithEntitiesByPageForDocument(long documentId)
+            throws DatabaseOperationException {
+
         return executeOperationSafely((session) -> {
+
             String sql = """
-                    WITH best_topic_per_sentence AS (
-                        SELECT DISTINCT ON (st.document_id, st.sentence_id)
-                            st.sentence_id,
-                            st.topiclabel
-                        FROM 
-                            sentencetopics st
-                        WHERE 
-                            st.document_id = :document_id
-                        ORDER BY 
-                            st.document_id, st.sentence_id, st.thetast DESC
-                    ),
-                    entities_in_sentences AS (
-                        SELECT DISTINCT
-                            s.id AS sentence_id,
-                            ne.typee AS entity_type
-                        FROM
-                            sentence s
-                            JOIN namedentity ne ON 
-                                ne.document_id = s.document_id AND
-                                ne.beginn >= s.beginn AND 
-                                ne.endd <= s.endd
-                        WHERE
-                            s.document_id = :document_id
-                    )
-                    SELECT
-                        btps.topiclabel,
-                        eis.entity_type
+                WITH best_topic_per_sentence AS (
+                    SELECT DISTINCT ON (st.document_id, st.sentence_id)
+                        st.sentence_id,
+                        st.topiclabel
+                    FROM 
+                        sentencetopics st
+                    WHERE 
+                        st.document_id = :document_id
+                    ORDER BY 
+                        st.document_id, st.sentence_id, st.thetast DESC
+                ),
+                entities_in_sentences AS (
+                    SELECT DISTINCT
+                        s.id AS sentence_id,
+                        ne.typee AS entity_type
                     FROM
-                        best_topic_per_sentence btps
-                        JOIN entities_in_sentences eis ON btps.sentence_id = eis.sentence_id
-                    ORDER BY
-                        btps.sentence_id, eis.entity_type
-                    """;
+                        sentence s
+                        JOIN namedentity ne ON 
+                            ne.document_id = s.document_id AND
+                            ne.beginn >= s.beginn AND 
+                            ne.endd <= s.endd
+                    WHERE
+                        s.document_id = :document_id
+                )
+                SELECT
+                    btps.topiclabel,
+                    eis.entity_type
+                FROM
+                    best_topic_per_sentence btps
+                    JOIN entities_in_sentences eis ON btps.sentence_id = eis.sentence_id
+                ORDER BY
+                    btps.sentence_id, eis.entity_type
+                """;
 
             Query<Object[]> query = session.createNativeQuery(sql)
                     .setParameter("document_id", documentId);
@@ -2128,7 +2140,10 @@ public class PostgresqlDataInterface_Impl implements DataInterface {
 
     public Map<Long, Long> getUnifiedTopicToSentenceMap(long documentId) throws DatabaseOperationException {
         return executeOperationSafely((session) -> {
-            String sql = "SELECT unifiedtopic_id, sentence_id FROM sentencetopics WHERE document_id = :documentId";
+            String sql = "SELECT unifiedtopic_id, sentence_id " +
+                            "FROM sentencetopics " +
+                            "WHERE document_id = :documentId " +
+                            "AND unifiedtopic_id IS NOT NULL";
 
             var query = session.createNativeQuery(sql)
                     .setParameter("documentId", documentId);
@@ -2268,6 +2283,338 @@ public class PostgresqlDataInterface_Impl implements DataInterface {
 
     private String escapeSql(String input) {
         return input.replace("(", "\\(").replace(")", "\\)").replace(":", "\\:").replace("|", "\\|");
+    }
+
+    /**
+     * Inserts a sentence-level topic classification into the database.
+     * This method matches a sentence by its begin and end
+     * offsets within a given document and inserts a corresponding entry into the sentencetopics table
+     */
+    public int insertSentenceTopicBySpan(long documentId, int begin, int end,
+                                         String topicLabel, double score, String modelMap)
+            throws DatabaseOperationException {
+
+        return executeOperationSafely((session) -> {
+
+            String sql =
+                    "INSERT INTO sentencetopics (document_id, sentence_id, topiclabel, thetast, model_id) " +
+                            "SELECT :docId, s.id, :label, :score, m.id " +
+                            "FROM sentence s " +
+                            "JOIN models m ON m.map = :modelMap " +
+                            "WHERE s.document_id = :docId AND s.beginn = :begin AND s.endd = :end " +
+                            "AND NOT EXISTS ( " +
+                            "  SELECT 1 FROM sentencetopics st " +
+                            "  WHERE st.sentence_id = s.id " +
+                            "    AND st.topiclabel = :label " +
+                            "    AND st.model_id = m.id " +
+                            ")";
+
+            var query = session.createNativeQuery(sql);
+            query.setParameter("docId", documentId);
+            query.setParameter("begin", begin);
+            query.setParameter("end", end);
+            query.setParameter("label", topicLabel);
+            query.setParameter("score", score);
+            query.setParameter("modelMap", modelMap);
+
+            return query.executeUpdate();
+        });
+    }
+    /**
+     * Create unifiedtopic rows if missing for sentences that have sentencetopics
+     * Backfill sentencetopics.unifiedtopic_id
+     */
+    public int ensureUnifiedTopicsForSentenceTopics(long documentId) throws DatabaseOperationException {
+        return executeOperationSafely(session -> {
+
+
+            String insertUnifiedTopics =
+                    "INSERT INTO unifiedtopic (document_id, beginn, endd, coveredtext, islexicalized, page_id) " +
+                            "SELECT DISTINCT s.document_id, s.beginn, s.endd, s.coveredtext, s.islexicalized, s.page_id " +
+                            "FROM sentence s " +
+                            "JOIN sentencetopics st ON st.sentence_id = s.id AND st.document_id = :docId " +
+                            "LEFT JOIN unifiedtopic ut " +
+                            "  ON ut.document_id = s.document_id AND ut.beginn = s.beginn AND ut.endd = s.endd " +
+                            "WHERE ut.id IS NULL";
+
+            session.createNativeQuery(insertUnifiedTopics)
+                    .setParameter("docId", documentId)
+                    .executeUpdate();
+
+
+            String updateSentenceTopics =
+                    "UPDATE sentencetopics st " +
+                            "SET unifiedtopic_id = ut.id " +
+                            "FROM sentence s " +
+                            "JOIN unifiedtopic ut " +
+                            "  ON ut.document_id = s.document_id AND ut.beginn = s.beginn AND ut.endd = s.endd " +
+                            "WHERE st.document_id = :docId " +
+                            "  AND st.sentence_id = s.id " +
+                            "  AND st.unifiedtopic_id IS NULL";
+
+            int updated = session.createNativeQuery(updateSentenceTopics)
+                    .setParameter("docId", documentId)
+                    .executeUpdate();
+
+            return updated;
+        });
+    }
+
+    public int createSentenceEmotions(long documentId) throws DatabaseOperationException {
+        return executeOperationSafely(session -> {
+            String createSentenceEmotions =
+                    """
+                        INSERT INTO sentenceemotions (sentence_id, emotion_id, model_id, document_id)
+                        SELECT s.id, e.id, e.model_id, s.document_id
+                        FROM emotion e
+                        JOIN sentence s
+                          ON s.beginn = e.beginn AND s.endd = e.endd and s.document_id = :docId 
+                        WHERE NOT EXISTS(
+                          SELECT 1 FROM sentenceemotions se     
+                          WHERE se.sentence_id = s.id AND se.emotion_id = e.id
+                        );
+                    """;
+
+            System.out.println(documentId);
+            return session.createNativeQuery(createSentenceEmotions)
+                    .setParameter("docId", documentId)
+                    .executeUpdate();
+        });
+    }
+
+    public void saveNewEmotionsForDocument(long documentId, List<org.texttechnologylab.uce.common.models.corpus.emotion.Emotion> newEmotions) throws DatabaseOperationException {
+        executeOperationSafely((session) -> {
+            Document doc = session.get(Document.class, documentId);
+            if (doc != null) {
+                Hibernate.initialize(doc.getEmotions());
+                for (var emotion : newEmotions) {
+                    if (emotion.getDbModel() != null) {
+                        emotion.setDbModel((ModelEntity) session.merge(emotion.getDbModel()));
+                    }
+                }
+                doc.getEmotions().addAll(newEmotions);
+                session.update(doc);
+            }
+            return null;
+        });
+    }
+
+
+    
+    @Override
+    public void saveOrUpdateModelEntity(ModelEntity model) throws DatabaseOperationException{
+        executeOperationSafely((session) -> {
+            session.saveOrUpdate(model);
+            return null;
+        });
+    }
+    
+    @Override
+    public ModelEntity getModelEntityByKey(String modelKey) throws DatabaseOperationException{
+        return executeOperationSafely((session) -> {
+            var cb = session.getCriteriaBuilder();
+            var cq = cb.createQuery(ModelEntity.class);
+            var root = cq.from(ModelEntity.class);
+            
+            cq.select(root).where(cb.equal(root.get("modelKey"),modelKey));
+            
+            var query = session.createQuery(cq);
+            query.setMaxResults(1);
+            return query.uniqueResult();
+        });
+    }
+
+    @Override
+    public ModelEntity getModelEntityByMap(String mapString) throws DatabaseOperationException {
+        return executeOperationSafely((session) -> {
+            var cb = session.getCriteriaBuilder();
+            var cq = cb.createQuery(org.texttechnologylab.uce.common.models.ModelEntity.class);
+            var root = cq.from(org.texttechnologylab.uce.common.models.ModelEntity.class);
+            
+            cq.select(root).where(cb.equal(root.get("map"), mapString));
+
+            var query = session.createQuery(cq);
+            query.setMaxResults(1);
+            return query.uniqueResult();
+        });
+    }
+
+    /**
+     * Creates a models table in the database and stores all models from models.json
+     */
+    public void initializeModelsFromJson(){
+        try(InputStream is = getClass().getClassLoader().getResourceAsStream("models.json");
+            InputStreamReader reader = new InputStreamReader(is, StandardCharsets.UTF_8)){
+            Type type = new TypeToken<Map<String, Map<String, String>>>(){}.getType();
+            Map<String, Map<String, String>> modelsMap = gson.fromJson(reader, type);
+            
+            if (modelsMap != null){
+                for (Map.Entry<String,Map<String,String>> entry : modelsMap.entrySet()){
+                    String key = entry.getKey();
+                    Map<String,String> info = entry.getValue();
+                    ModelEntity dbModel = getModelEntityByKey(key);
+                    if(dbModel == null){
+                        dbModel = new ModelEntity();
+                        dbModel.setModelKey(key);
+                    }
+                    dbModel.setName(info.get("Name"));
+                    dbModel.setUrl(info.get("url"));
+                    dbModel.setGithub(info.get("github"));
+                    dbModel.setHuggingface(info.get("huggingface"));
+                    dbModel.setPaper(info.get("paper"));
+                    dbModel.setMap(info.get("map"));
+                    dbModel.setVariant(info.get("Variant"));
+                    dbModel.setMainTool(info.get("Main Tool"));
+                    dbModel.setModelType(info.get("type"));
+                    
+                    saveOrUpdateModelEntity(dbModel);
+                }
+            }
+            
+        } catch (IOException e) {
+            System.err.println("Error during initializing models from models.json");
+        } catch (DatabaseOperationException e) {
+            System.err.println("Error during getting ModalEntity from database");
+        }
+    }
+    public List<Object[]> getEmotionByPage(long documentId, Long modelId) throws DatabaseOperationException {
+        return executeOperationSafely((session) -> {
+
+            String sql;
+            var query = session.createNativeQuery("");
+
+            if (modelId == null) {
+                sql = """
+            WITH best_emotion_per_sentence AS (
+                SELECT DISTINCT ON (se.document_id, se.sentence_id)
+                    se.sentence_id,
+                    f.feeling AS emotion_label,
+                    f.value   AS emotion_value
+                FROM sentenceemotions se
+                JOIN emotion e ON e.id = se.emotion_id
+                JOIN feeling f ON f.emotion_id = e.id
+                WHERE se.document_id = :documentId
+                ORDER BY se.document_id, se.sentence_id, f.value DESC
+            )
+            SELECT
+                s.page_id,
+                bes.emotion_label
+            FROM best_emotion_per_sentence bes
+            JOIN sentence s ON s.id = bes.sentence_id
+            WHERE s.document_id = :documentId
+            ORDER BY s.page_id, bes.emotion_label
+            """;
+
+                query = session.createNativeQuery(sql)
+                        .setParameter("documentId", documentId, LongType.INSTANCE);
+            } else {
+                sql = """
+            WITH best_emotion_per_sentence AS (
+                SELECT DISTINCT ON (se.document_id, se.sentence_id)
+                    se.sentence_id,
+                    f.feeling AS emotion_label,
+                    f.value   AS emotion_value
+                FROM sentenceemotions se
+                JOIN emotion e ON e.id = se.emotion_id
+                JOIN feeling f ON f.emotion_id = e.id
+                WHERE se.document_id = :documentId
+                  AND se.model_id = :modelId
+                ORDER BY se.document_id, se.sentence_id, f.value DESC
+            )
+            SELECT
+                s.page_id,
+                bes.emotion_label
+            FROM best_emotion_per_sentence bes
+            JOIN sentence s ON s.id = bes.sentence_id
+            WHERE s.document_id = :documentId
+            ORDER BY s.page_id, bes.emotion_label
+            """;
+
+                query = session.createNativeQuery(sql)
+                        .setParameter("documentId", documentId, LongType.INSTANCE)
+                        .setParameter("modelId", modelId, LongType.INSTANCE);
+            }
+
+            return query.getResultList();
+        });
+    }
+    public List<Object[]> getEmotionRadarForDocument(long documentId, Long modelId) throws DatabaseOperationException {
+        return executeOperationSafely((session) -> {
+
+            String sql = """
+            SELECT
+                f.feeling AS feeling_label,
+                AVG(f.value) AS avg_value
+            FROM sentenceemotions se
+            JOIN emotion e ON e.id = se.emotion_id
+            JOIN feeling f ON f.emotion_id = e.id
+            WHERE se.document_id = :documentId
+              AND (:modelId IS NULL OR se.model_id = :modelId)
+            GROUP BY f.feeling
+            ORDER BY avg_value DESC
+            LIMIT 12
+        """;
+
+            var query = session.createNativeQuery(sql)
+                    .setParameter("documentId", documentId)
+                    .setParameter("modelId", modelId);
+
+            return query.getResultList();
+        });
+    }
+    public List<Object[]> getEmotionModelsForDocumentWithName(long documentId) throws DatabaseOperationException {
+        return executeOperationSafely((session) -> {
+            String sql = """
+            SELECT DISTINCT m.id AS model_id, m.name AS model_name
+            FROM sentenceemotions se
+            JOIN models m ON m.id = se.model_id
+            WHERE se.document_id = :documentId
+            ORDER BY m.id
+        """;
+
+            return session.createNativeQuery(sql)
+                    .setParameter("documentId", documentId)
+                    .getResultList();
+        });
+    }
+    
+    public void updateCorpusJsonConfig(long corpusId,String jsonConfig) throws DatabaseOperationException{
+        executeOperationSafely((session) -> {
+            Corpus corpus = session.get(Corpus.class,corpusId);
+            if (corpus != null){
+                corpus.setCorpusJsonConfig(jsonConfig);
+                session.update(corpus);
+            }
+            return null;
+        });
+    }
+
+    public void saveNewSentenceTopicsForDocument(long documentId, List<SentenceTopic> newSentenceTopics)
+            throws DatabaseOperationException {
+
+        executeOperationSafely(session -> {
+            Document doc = session.get(Document.class, documentId);
+
+            if (doc == null || newSentenceTopics == null || newSentenceTopics.isEmpty()) {
+                return null;
+            }
+
+            for (SentenceTopic st : newSentenceTopics) {
+                st.setDocument(doc);
+
+                if (st.getSentence() != null) {
+                    st.setSentence(session.get(Sentence.class, st.getSentence().getId()));
+                }
+
+                if (st.getModel() != null) {
+                    st.setModel((ModelEntity) session.merge(st.getModel()));
+                }
+
+                session.save(st);
+            }
+
+            return null;
+        });
     }
 
 }

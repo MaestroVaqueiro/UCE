@@ -3,6 +3,7 @@ package org.texttechnologylab.uce.common.models.corpus.emotion;
 import lombok.Getter;
 import lombok.Setter;
 import org.texttechnologylab.uce.common.annotations.Typesystem;
+import org.texttechnologylab.uce.common.models.ModelEntity;
 import org.texttechnologylab.uce.common.models.UIMAAnnotation;
 import org.texttechnologylab.uce.common.models.WikiModel;
 
@@ -18,11 +19,14 @@ import java.util.Locale;
 @Typesystem(types = {Emotion.class})
 public class Emotion extends UIMAAnnotation implements WikiModel {
 
-    private String model;
-
     @OneToMany(cascade = CascadeType.ALL)
     @JoinColumn(name = "emotion_id")
     private List<Feeling> feelings;
+    
+    @ManyToOne
+    @JoinColumn(name = "model_id")
+    private ModelEntity dbModel;
+
 
     public String generateEmotionMarker() {
         var tooltip = "";

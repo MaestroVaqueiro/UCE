@@ -5,12 +5,14 @@ import org.hibernate.boot.MetadataSources;
 import org.hibernate.boot.registry.StandardServiceRegistryBuilder;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.transaction.annotation.EnableTransactionManagement;
+import org.texttechnologylab.uce.common.models.ModelEntity;
 import org.texttechnologylab.uce.common.models.biofid.BiofidTaxon;
 import org.texttechnologylab.uce.common.models.biofid.GazetteerTaxon;
 import org.texttechnologylab.uce.common.models.biofid.GnFinderTaxon;
 import org.texttechnologylab.uce.common.models.corpus.*;
 import org.texttechnologylab.uce.common.models.corpus.emotion.Emotion;
 import org.texttechnologylab.uce.common.models.corpus.emotion.Feeling;
+import org.texttechnologylab.uce.common.models.corpus.emotion.SentenceEmotions;
 import org.texttechnologylab.uce.common.models.corpus.links.AnnotationLink;
 import org.texttechnologylab.uce.common.models.corpus.links.AnnotationToDocumentLink;
 import org.texttechnologylab.uce.common.models.corpus.links.DocumentLink;
@@ -19,10 +21,7 @@ import org.texttechnologylab.uce.common.models.gbif.GbifOccurrence;
 import org.texttechnologylab.uce.common.models.imp.ImportLog;
 import org.texttechnologylab.uce.common.models.imp.UCEImport;
 import org.texttechnologylab.uce.common.models.negation.*;
-import org.texttechnologylab.uce.common.models.topic.TopicValueBase;
-import org.texttechnologylab.uce.common.models.topic.TopicValueBaseWithScore;
-import org.texttechnologylab.uce.common.models.topic.TopicWord;
-import org.texttechnologylab.uce.common.models.topic.UnifiedTopic;
+import org.texttechnologylab.uce.common.models.topic.*;
 
 import java.util.HashMap;
 
@@ -55,6 +54,7 @@ public class HibernateConf {
         metadataSources.addAnnotatedClass(Sentiment.class);
         metadataSources.addAnnotatedClass(Emotion.class);
         metadataSources.addAnnotatedClass(Feeling.class);
+        metadataSources.addAnnotatedClass(SentenceEmotions.class);
         metadataSources.addAnnotatedClass(GeoName.class);
         metadataSources.addAnnotatedClass(Paragraph.class);
         metadataSources.addAnnotatedClass(Sentence.class);
@@ -86,6 +86,9 @@ public class HibernateConf {
         metadataSources.addAnnotatedClass(TopicWord.class);
         metadataSources.addAnnotatedClass(TopicValueBase.class);
         metadataSources.addAnnotatedClass(TopicValueBaseWithScore.class);
+        metadataSources.addAnnotatedClass(SentenceTopic.class);
+        //models
+        metadataSources.addAnnotatedClass(ModelEntity.class);
 
         metadataSources.addAnnotatedClass(DocumentTopThreeTopics.class);
         var metadata = metadataSources.buildMetadata();
